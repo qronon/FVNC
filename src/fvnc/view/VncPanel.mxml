@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+ * FVNC: A VNC Client for Flash Player 9 and above
+ * Copyright (C) 2005-2006 Darron Schall <darron@darronschall.com>
+ * 
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as
+ * published by the Free Software Foundation; either version 2 of the
+ * License, or (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+ * 02111-1307 USA
+-->
+<mx:Canvas
+	xmlns:mx="http://www.adobe.com/2006/mxml"
+	creationComplete="initializeComponents();"
+	paddingLeft="0" paddingRight="0" paddingTop="0" paddingBottom="0">
+	
+	<mx:Script>
+		<![CDATA[
+			import fvnc.rfb.tree.RFBServerMessage;
+			import mx.core.EdgeMetrics;
+			import mx.events.CloseEvent;
+			import mx.events.FlexEvent;
+			import fvnc.rfb.*;
+			import fvnc.events.*;
+			import fvnc.rfb.constants.*;
+			import flash.events.*;
+			import flash.errors.*;
+			import flash.geom.*;
+			import flash.display.*;
+			import flash.utils.*;
+			import flash.ui.*
+			import mx.containers.TitleWindow;
+			import mx.core.UIComponent;
+	
+			// A reference to the remote settings on the server, including name,
+			// screen height, and pixel format.
+			private var _settings:Object;
+			
+			// A reference to an open RFB socket ready to process client/server
+			// messages ( assuming the handshaking phase is already complete )
+			private var _rfb:RFBProtocol;
+			
+			// Draw inside screenImageData via lock/unlock instead of
+			// using a double buffering technique.  This is attached to 
+			// screenImage on the DispalyList so things get updated visually.
+			private var screenImage:Bitmap;
+			private var screenImageData:BitmapData;
+			
+			// The rectangle that defines the screen bounds to
+			// be used for frame buffer updates
+			private var screenBounds:Rectangle;
+			
+			private var parser:RFBParser;
+			
+			// keep track of our server messages until the next frame
+			[ArrayElementType( "fvnc.rfb.RFBServerMEssage" )]
+			private var messages:Array;
+	
+			/**
+			 * Sets the RFB Protocol that this panel is going to get its data from.  It
+			 * is assumed that all of the handshaking is already "complete" and the protocol
+			 * is ready to send/receive data normally.
+			 */
+			public function set rfb( rfb:RFBProtocol ):void
+			{
+				_rfb = rfb;
+			}
+			
+			/**
+			 * Sets the remove server settings of the server on the other end of the socket.
+			 */
+			public function set settings( serverInit:Object ):void
+			{
+				_settings = serverInit;
+				
+				// Set the title of the panel to the name of the server we connected to
+				//this.title = _settings.name;
+				
+				// Configure the remoteScreen component to have a width and height to 
+				// match that of the remote server
+				canvas.width = remoteScreen.width = _settings.frameBufferWidth;
+				canvas.height = remoteScreen.height = _settings.frameBufferHeight;
+			}
+			
+			/**
+			 * Change the scale based on whether or not the whole remote screen should
+			 * be fit into the current display area.
+			 */
+			public function enableFitToScreen( enable:Boolean = true ):void
+			{
+				if ( enable )
+				{
+					// Fit to screen
+					var metrics:EdgeMetrics = viewMetrics;
+					remoteScreen.scaleX = ( width - viewMetrics.left - viewMetrics.right ) / remoteScreen.width;
+					remoteScreen.scaleY = ( height - viewMetrics.top - viewMetrics.bottom ) / remoteScreen.height;
+					verticalScrollPolicy = canvas.verticalScrollPolicy = "off";
+					horizontalScrollPolicy = canvas.horizontalScrollPolicy = "off";	
+					
+					// Maintain aspect ratio
+					remoteScreen.scaleX = Math.min( remoteScreen.scaleX, remoteScreen.scaleY );
+					remoteScreen.scaleY = remoteScreen.scaleX;
+				}
+				else
+				{
+					remoteScreen.scaleX = 1;
+					remoteScreen.scaleY = 1;
+					verticalScrollPolicy = canvas.verticalScrollPolicy = "auto";
+					horizontalScrollPolicy = canvas.horizontalScrollPolicy = "auto";	
+				}
+			}
+			
+			/**
+			 * Runs initialization when the panel is first created and displayed.
+			 */
+			protected function initializeComponents():void
+			{
+				messages = new Array();
+				parser = new RFBParser();
+				
+				// Whenever we receive data over the socket, fire off the onSocketData method
+				_rfb.addEventListener( ProgressEvent.SOCKET_DATA, onSocketData );
+				
+				// Whenever the player tries to draw a frame, attempt to process a server message
+				// to update the screen (chances are the message is a frame buffer update)
+				addEventListener( Event.ENTER_FRAME, processServerMessages );
+				
+				// Create a list of supported encodings, in the order of preference
+				var encodings:Array = [ 
+										//Encoding.ZLIBHEX
+										//Encoding.ZRLE
+										Encoding.HEXTILE
+										,Encoding.COPY_RECT
+										,Encoding.RRE
+										,Encoding.RAW
+										,Encoding.CURSOR
+									  ];
+				
+				// Tell the VNC Server our encoding preferences
+				_rfb.writeSetEncodings( encodings );
+				
+				// Force a 16-bit pixel format
+				// TODO: Let the user configure this
+				var pixelFormat:PixelFormat = new PixelFormat();
+				pixelFormat.bitsPerPixel = 16;
+				pixelFormat.depth = 15;
+				pixelFormat.bigEndian = true;
+				pixelFormat.trueColor = true;
+				pixelFormat.redMax = 31;
+				pixelFormat.redShift = 10;
+				pixelFormat.greenMax = 31;
+				pixelFormat.greenShift = 5;
+				pixelFormat.blueMax = 31;
+				pixelFormat.blueShift = 0;
+				
+				// Let the server know the pixel format we're using
+				_rfb.writeSetPixelFormat( pixelFormat );
+				
+				// Create the bitmap that we'll perform calculations on
+				screenImageData = new BitmapData( _settings.frameBufferWidth, 
+											   	  _settings.frameBufferHeight, 
+											   	  false ); // not transparent
+											   	  
+				// The onScreenPixels are the ones attached to the DisplayList ( screen )
+				screenImage = new Bitmap( screenImageData );
+				remoteScreen.addChild( screenImage );
+	
+				// Every time we update the frame buffer, we'll ask to update the frame buffer
+				// again, which means we need to send the bounds rectangle.  So, we'll save
+				// the screen bounds as a rectangle for re-use in asking for the updates.
+				screenBounds = new Rectangle( 0, 0, 
+										_settings.frameBufferWidth,
+										_settings.frameBufferHeight );
+							
+				// Request the initial screen from the server
+				_rfb.writeFrameBufferUpdateRequest( screenBounds, false );
+				
+				// Whenever the mouse moves, let the server know
+				remoteScreen.addEventListener( MouseEvent.MOUSE_MOVE, handleMouseEvent );
+				remoteScreen.addEventListener( MouseEvent.MOUSE_DOWN, handleMouseEvent );
+				remoteScreen.addEventListener( MouseEvent.MOUSE_UP, handleMouseEvent );
+				remoteScreen.addEventListener( MouseEvent.MOUSE_WHEEL, handleMouseEvent );
+				
+				// Whenever a key is pressed, let the server know
+				addEventListener( KeyboardEvent.KEY_UP, handleKeyUp );
+				addEventListener( KeyboardEvent.KEY_DOWN, handleKeyDown );
+				// In order to receive key events, we need to set the focus first to the
+				// remote screen
+				stage.focus = this;
+			}
+			
+			/**
+			 * Event handler:  Called when data is received from the socket
+			 */
+			private function onSocketData( pe:ProgressEvent ):void
+			{
+				// Parse the new data the came in
+				var newMessages:Array = parser.parse( _rfb );
+				
+				// Merge any existing messages with the new ones that were just read
+				if ( newMessages.length )
+				{
+					messages = messages.concat( newMessages );
+				}
+			}
+			
+			/**
+			 * Event handler:  Called when we receive some sort of interaction from
+			 * the mouse.  We'll pass the mouse interaction over RFB to the remote server.
+			 */
+			private function handleMouseEvent( event:MouseEvent ):void
+			{
+				// Send the mouse event to the server
+				_rfb.writePointerEvent( event );
+			}
+			
+			/**
+			 * Event handler:  Called when we receive a key release.  Send the event
+			 * over RFB to the remote server.
+			 */
+			private function handleKeyUp( event:KeyboardEvent ):void
+			{
+				// Prevent the key event from bubbling up the UI.  This is importnt
+				// as, for example, if we press the "up" arrow key the remoteScreen
+				// might think we're pressing "up" to move the scrollbars up if 
+				// they are displayed.  We don't want this side effect, so stopping
+				// the event at this level prevents anyone else from handling it.
+				event.stopPropagation();
+				_rfb.writeKeyUpEvent( event );	
+			}
+			
+			/**
+			 * Event handler:  Called when we receive a key release.  Send the event
+			 * over RFB to the remote server.
+			 */
+			private function handleKeyDown( event:KeyboardEvent ):void
+			{
+				// Prevent the key event from bubbling up the UI.  This is importnt
+				// as, for example, if we press the "up" arrow key the remoteScreen
+				// might think we're pressing "up" to move the scrollbars up if 
+				// they are displayed.  We don't want this side effect, so stopping
+				// the event at this level prevents anyone else from handling it.
+				event.stopPropagation();
+				_rfb.writeKeyDownEvent( event );
+			}
+			
+			/**
+			 * Event handler:  Called whenever the player tries to draw a frame.  This
+			 * will inspect the parsed messages and act on them ( which is most likely 
+			 a frame buffer update that causes changes to the screen )
+			 */
+			private function processServerMessages( event:Event ):void
+			{
+				// Only process if there is at least one complete message available
+				if ( messages.length )
+				{
+					for ( var i:int = 0; i < messages.length; i++ )
+					{
+						var message:RFBServerMessage = messages[i];
+						message.execute( screenImageData );
+					}
+
+					// Clear the messages that have been executed
+					messages = new Array();
+					
+					// TODO: Where to put the below code?  If we put it in this loop
+					// the remote screen doesn't appear as responsive, but if we
+					// put it outsite the loop, that's a lot of network traffic
+					// and procudes intermittent errors when reading the RFB data...
+				
+					// Ask for the latest screen from the server
+					_rfb.writeFrameBufferUpdateRequest( screenBounds );
+				}
+				
+			}
+			
+		]]>
+	</mx:Script>
+	
+	<!-- 
+		Force the remote screen canvas to be inside of a smaller one so
+		that we get scroll bars, instead of a huge popup window based on the
+		frame buffer width and height 
+	-->
+	<mx:Canvas id="canvas">
+	   	<mx:UIComponent id="remoteScreen" />
+   	</mx:Canvas>
+    
+</mx:Canvas>

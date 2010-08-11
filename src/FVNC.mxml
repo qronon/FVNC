@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+ * FVNC: A VNC Client for Flash Player 9 and above
+ * Copyright (C) 2005-2006 Darron Schall <darron@darronschall.com>
+ * 
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License as
+ * published by the Free Software Foundation; either version 2 of the
+ * License, or (at your option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
+ * 
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
+ * 02111-1307 USA
+-->
+<mx:Application 
+	xmlns:mx="http://www.adobe.com/2006/mxml" 
+	xmlns="*"
+	xmlns:view="fvnc.view.*"
+	frameRate="60" backgroundColor="white"
+	creationComplete="initializeComponents();">
+    
+	<mx:Script>
+		<![CDATA[
+			import mx.managers.PopUpManager;
+			import mx.utils.ObjectUtil;
+			import flash.events.*;
+			import flash.geom.Rectangle;
+			import com.darronschall.utils.*;
+			import org.osflash.cryptography.*;
+			import fvnc.rfb.*;
+			import fvnc.view.*;
+			import fvnc.events.*;
+			import fvnc.errors.*;
+			import fvnc.rfb.constants.*;
+			import mx.controls.Alert;
+			
+			private var rfb:RFBProtocol;
+			
+			/** The intial state of the protocol is not connected */
+			private var state:int = ProtocolState.NOT_CONNECTED;
+			
+			/**
+			 * Map protocol states the to functions that will handle
+			 * the data for the protocol at that particular state
+			 */
+			private var statesMap:Object = new Object();
+			
+			/**
+			 * For authentication purposes, we receive a challenge
+			 * that we need to provide a response for
+			 */
+			private var challenge:ByteArray;
+			
+			/**
+			 * If authentical is required, we'll need to create
+			 * an authentication panel to validate the password
+			 */
+			private var authPanel:AuthenticationPanel;
+			
+			/** Flag to determine how the remote screen should be drawn in the VNC panel */
+			private var fitToScreen:Boolean;
+			
+			/**
+			 * The VNC panel is to display and interact with the 
+			 * remote desktop
+			 */
+			private var vncPanel:VncPanel = null;
+			
+			/**
+			 * Performs initialization after the application components
+			 * are created.
+			 */
+			public function initializeComponents():void
+			{
+				connectionPanel.addEventListener( ConnectEvent.CONNECT_EVENT_TYPE, onConnectionAttempt );
+					
+				statesMap[ ProtocolState.NOT_CONNECTED 	  ] = handshake;
+				statesMap[ ProtocolState.GET_AUTH_SCHEME  ] = authenticate;
+				statesMap[ ProtocolState.GET_CHALLENGE    ] = getChallenge;
+				statesMap[ ProtocolState.GET_AUTH_RESULT  ] = processAuthResult;
+				statesMap[ ProtocolState.READ_SERVER_INIT ] = doInitialization;
+				statesMap[ ProtocolState.READ_SERVER_NAME ] = doReadServerName;
+				
+				// The VNCPanel handles the socket messages in the connected state
+				statesMap[ ProtocolState.CONNECTED        ] = null;
+			}
+			
+			/**
+			 * This is called when the user presses the connect button in
+			 * the connection panel.
+			 */
+			public function onConnectionAttempt( ce:ConnectEvent ):void
+			{
+				Security.loadPolicyFile( "http://" + ce.host + "/crossdomain.xml" );
+				
+				// Disable the connection button while we're attempting to connect
+				connectionPanel.connectButton.enabled = false;
+				
+				// Save the fit to screen variable to be used later
+				fitToScreen = ce.fitToScreen;
+				
+				rfb = new RFBProtocol( ce.host, ce.port );
+			
+				rfb.addEventListener( Event.CONNECT , onConnect );
+				rfb.addEventListener( ProgressEvent.SOCKET_DATA , onSocketData );
+				rfb.addEventListener( IOErrorEvent.IO_ERROR, onIOError );
+				// Fix for ticket #11
+				rfb.addEventListener( Event.CLOSE, closeConnection );
+			}
+			
+			/**
+			 * Called when a connection is establisted with the remote server
+			 */
+			private function onConnect( event:Event ):void
+			{
+//				trace( "Socket connected." );
+			}
+			
+			/**
+			 * Called when there is a problem interacting with data in the socket
+			 */
+			private function onIOError( event:IOErrorEvent ):void
+			{
+				if ( state == ProtocolState.NOT_CONNECTED )
+				{
+//					trace( "Could not connect!" );
+					Alert.show( "Could not connect to server..." );
+				}
+				else
+				{
+					Alert.show( "IO error" );
+				}
+				
+//				trace( event.text );
+				
+				// Re-enable the connection button
+				connectionPanel.connectButton.enabled = true;
+			}
+			
+			/**
+			 * Event handler:  Called whenever new data is available in the
+			 * socket.  Based on the state of the protocol, execute the
+			 * appropriate function to handle the data coming in.
+			 */
+			private function onSocketData( pe:ProgressEvent ):void
+			{
+//				trace( "[Socket data] [available: " + rfb.bytesAvailable + "]" );
+				
+				statesMap[ state ]( pe );
+			}
+			
+			/**
+			 * When the socket initially connects, we need to handshake to
+			 * establish version information.
+			 */
+			private function handshake( pe:ProgressEvent ):void
+			{
+				rfb.readVersion();
+//				trace( "RFB server supports protocol version " + rfb.majorVersion + "." + rfb.minorVersion );
+				rfb.writeVersion();
+				
+				// After version is decided, the protocol is waiting for
+				// the authentication scheme
+				state = ProtocolState.GET_AUTH_SCHEME;
+			}
+			
+			/**
+			 * Called when the protocol responds with the authentication
+			 * method available.
+			 */
+			private function authenticate( pe:ProgressEvent ):void
+			{
+				var authScheme:int
+				
+				try 
+				{
+					authScheme = rfb.readAuthenticationScheme();
+				} 
+				catch ( ce:ConnectionError )
+				{
+					Alert.show( "Connection Error: " + ce.message );
+					closeConnection();
+					return;
+				}
+			
+				switch ( authScheme )
+				{
+					// Authentication required
+					case SecurityType.VNC_AUTHENTICATION:
+						// Create the authentication panel
+						authPanel = AuthenticationPanel(
+							PopUpManager.createPopUp( this, AuthenticationPanel, true) );
+						PopUpManager.centerPopUp( authPanel );
+							
+						// Listen for the password to be entered
+						authPanel.addEventListener( PasswordEvent.PASSWORD_EVENT_TYPE, answerChallenge );
+						
+						// After we read the auththentication scheme, we need to get
+						// the encryption challenge
+						state = ProtocolState.GET_CHALLENGE;			
+						
+						// Force an onSocketData if the server gave us back
+						// all 20 bytes instead of a separate 4 + 16
+						if ( rfb.bytesAvailable > 0 ) {
+							onSocketData( pe );
+						}
+						
+						break;
+					
+					// No authentication required
+					case SecurityType.NONE:
+						state = ProtocolState.READ_SERVER_INIT;
+						rfb.writeClientInit( true ); // true so display is shared
+						break;
+				}
+				
+			}
+			
+			/**
+			 * Saves the encyption challenge sent from the server so that
+			 * we can answer the challenge with our password
+			 */
+			private function getChallenge( pe:ProgressEvent ):void
+			{
+				challenge = rfb.readChallenge();
+				
+				// Once we read the challenge, we have to write the 
+				// challenege and the next read will be the
+				// authentication result
+				state = ProtocolState.GET_AUTH_RESULT;
+			}
+			
+			/**
+			 * Called when the user enters a password from the authentication
+			 * panel.  We use the password as a key to encrypt the challenge
+			 * and then send the encrypted challenege back over the 
+			 * wirte.
+			 */
+			private function answerChallenge( pe:PasswordEvent ):void
+			{
+				PopUpManager.removePopUp( authPanel );
+				vncEncrypt( challenge, pe.password );
+				rfb.writeChallenge( challenge );
+			}
+			
+			/**
+			 * encrypt the challenge via a specific
+			 * password and set challenge to be its encrypted value.
+			 */
+			public static function vncEncrypt( challenge:ByteArray, pw:String ):void
+			{
+				var f:ByteArray = new ByteArray();
+				var s:ByteArray = new ByteArray();
+				
+				f.length = 8;
+				s.length = 8;
+				
+				challenge.position = 0;
+				challenge.readBytes( f, 0, 8 );
+				challenge.readBytes( s, 0, 8 );
+				
+				DES.load();
+				
+				var des:DES = new DES( pw, true );
+				
+				challenge.position = 0;
+				challenge.writeBytes( des.encrypt( f ) );
+				challenge.writeBytes( des.encrypt( s ) );
+				
+				DES.unload();
+			}
+			
+			/**
+			 * Called when the authentication result has been received.
+			 * Determine if the challenge was accepted and respond
+			 * accordinly.
+			 */
+			private function processAuthResult( pe:ProgressEvent ):void
+			{
+				var authResult:int = rfb.readInt();
+				
+				switch ( authResult )
+				{
+					case AuthenticationStatus.FAILED:
+						// Couldn't conect, so close the socket and let the
+						// user know the authentication failed.
+						mx.controls.Alert.show( "Authentication failed." );
+						closeConnection();
+						break;
+					
+					case AuthenticationStatus.OK:
+						// We're authorized now, so continue the handshake
+						// process by sending the client init and waiting
+						// for the server init back
+						state = ProtocolState.READ_SERVER_INIT;
+						rfb.writeClientInit( true ); // true so display is shared
+						break;
+						
+					default:
+						// Couldn't conect, so close the socket
+						closeConnection();
+						throw new Error(" Unknown authentication result: " + authResult );
+				}
+			}
+			
+			/** Temporary object to store the server initialization settings */
+			private var serverInit:Object;
+			
+			/**
+			 * Called when the server initialization parameters are
+			 * received.
+			 */
+			private function doInitialization( pe:ProgressEvent ):void
+			{
+				// Wait for enough data in the socket before continuing
+				if ( rfb.bytesAvailable < 24 )
+				{
+					return;	
+				}
+				
+				serverInit = rfb.readServerInit();
+				
+				state = ProtocolState.READ_SERVER_NAME;
+				// Force an onSocketData if the server gave us back
+				// the entire name as part of the init response
+				if ( rfb.bytesAvailable > 0 )
+				{
+					onSocketData( pe );
+				}
+				
+			}
+			
+			private function doReadServerName( pe:ProgressEvent ):void
+			{
+				// Wait for enough data in the socket before continuing
+				if ( rfb.bytesAvailable < serverInit.nameLength )
+				{
+					return;
+				}
+				
+				serverInit.name = rfb.readServerName( serverInit.nameLength );
+				
+				openVncPanel( serverInit );
+				
+				// At this point, we move the protocol data handling over to the VNC
+				// window since a connection has been established
+				state = ProtocolState.CONNECTED;
+				rfb.removeEventListener( ProgressEvent.SOCKET_DATA , onSocketData );	
+				
+			}
+			
+			/**
+			 * Opens the VNC Panel that will allow us to interact with
+			 * the remote screen
+			 */
+			private function openVncPanel( serverInit:Object ):void
+			{
+				// Create a new VNC Panel and pass along the information it needs
+				// to maintain the connected state to the server
+				vncPanel = VncPanel( PopUpManager.createPopUp( this, VncPanel, true ) );
+				vncPanel.width = width;
+				vncPanel.height = height;
+				vncPanel.rfb = rfb;
+				vncPanel.settings = serverInit;
+				addEventListener(Event.RESIZE,function(e:Event){
+					vncPanel.width = width;
+					vncPanel.height = height;
+				});
+				
+				// Have the screen fit into the viewable window
+				vncPanel.enableFitToScreen( fitToScreen );
+								
+				// When the window is closed, close the socket connection
+				vncPanel.addEventListener( Event.CLOSE, closeConnection );
+				PopUpManager.centerPopUp( vncPanel );
+			}
+			
+			/**
+			 * Closes the socket connection
+			 */
+			public function closeConnection( e:Event = null ):void
+			{
+				// Dispose of the screen when we disconnect if it is
+				// being displayed
+				if ( vncPanel != null )
+				{
+					PopUpManager.removePopUp( vncPanel );
+					vncPanel.removeEventListener( Event.CLOSE, closeConnection );
+					vncPanel = null;
+				}
+				
+				// Clear the socket
+				state = ProtocolState.NOT_CONNECTED;
+				rfb.close();
+				rfb = null;
+				
+				connectionPanel.connectButton.enabled = true;
+			}
+		]]>
+	</mx:Script>
+	
+	<view:ConnectionPanel id="connectionPanel" />
+		 
+</mx:Application>
